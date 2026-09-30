@@ -269,6 +269,257 @@ try:
 finally:
     geometry.verify_trajectory = orig
 
+# ================================================================= 出发时刻调度
+# 用独立的 8 月时段，避免与上面 9 月区域互相干扰
+r = client.post("/api/regions", json={
+    "name": "调度-方区",
+    "polygon": [[0, 0], [10, 0], [10, 10], [0, 10]],
+    "valid_from": "2026-08-15T00:00:00Z",
+    "valid_to": "2026-08-16T00:00:00Z",
+})
+sched_rid = r.json()["region"]["id"]
+rev_sched = client.get("/api/revision").json()["revision"]
+
+# 轨迹：0s 在 (-5,5)，60s 到 (15,5) → 相对 15s 进入、45s 离开方区
+SCHED_TRAJ = [
+    {"x": -5, "y": 5, "t": 0},
+    {"x": 15, "y": 5, "t": 60},
+]
+
+r = client.post("/api/schedule", json={
+    "points": SCHED_TRAJ,
+    "window_start": "2026-08-15T00:00:00Z",
+    "window_end": "2026-08-15T01:00:00Z",
+})
+check("schedule 200", r.status_code == 200, r.text)
+v = r.json()
+check("schedule 回显窗口（UTC，Z）",
+      v["window_start"] == "2026-08-15T00:00:00Z"
+      and v["window_end"] == "2026-08-15T01:00:00Z")
+check("schedule 带当前 revision", v["revision"] == rev_sched, str(v))
+# 禁止 [00:00-45s, 24:00-15s) 与窗口相交 → 安全只有 [00:00:00, 前一日 23:59:15)
+# 该段不在窗口内 → 窗口内安全段为空？不：禁止左端 = 2026-08-14T23:59:15Z，
+# 早于窗口起，窗口起即处于禁止中；禁止右端远超窗口 → 窗口内无安全时刻
+check("窗口整段在禁止中：intervals 为空", v["intervals"] == [], str(v))
+
+# 跨日窗口 [08-14 23:58, 08-15 00:01)：禁止左端 23:59:15 落在窗口内，
+# 窗口其余部分（23:59:15 之后）全部处于禁止中 → 只有 1 段安全
+r = client.post("/api/schedule", json={
+    "points": SCHED_TRAJ,
+    "window_start": "2026-08-14T23:58:00Z",
+    "window_end": "2026-08-15T00:01:00Z",
+})
+v = r.json()
+check("跨日窗口：仅前导 1 段安全 [23:58:00,23:59:15)",
+      len(v["intervals"]) == 1
+      and v["intervals"][0] == {
+          "start": "2026-08-14T23:58:00Z",
+          "end": "2026-08-14T23:59:15Z",
+          "start_inclusive": True, "end_inclusive": False},
+      str(v))
+
+# 窗口完全在禁止右端之后恢复：区域 valid_to=08-16 00:00，禁止右端=08-15 23:59:45
+r = client.post("/api/schedule", json={
+    "points": SCHED_TRAJ,
+    "window_start": "2026-08-15T23:59:45Z",
+    "window_end": "2026-08-16T01:00:00Z",
+})
+v = r.json()
+check("禁止右端（开）之后整窗安全，左端闭",
+      len(v["intervals"]) == 1
+      and v["intervals"][0]["start"] == "2026-08-15T23:59:45Z"
+      and v["intervals"][0]["end"] == "2026-08-16T01:00:00Z"
+      and v["intervals"][0]["start_inclusive"] is True
+      and v["intervals"][0]["end_inclusive"] is False, str(v))
+
+# 无接触轨迹：整窗安全
+r = client.post("/api/schedule", json={
+    "points": [{"x": 100, "y": 100, "t": 0}, {"x": 110, "y": 110, "t": 60}],
+    "window_start": "2026-08-15T00:00:00Z",
+    "window_end": "2026-08-15T01:00:00Z",
+})
+check("无接触：整窗安全一段",
+      r.status_code == 200 and len(r.json()["intervals"]) == 1
+      and r.json()["intervals"][0]["start"] == "2026-08-15T00:00:00Z"
+      and r.json()["intervals"][0]["end"] == "2026-08-15T01:00:00Z", r.text)
+
+# 单点接触：专用区域（其它 9 月区域在本窗口不生效，保证隔离）。
+# 轨迹 5s 时擦过角点 (10,10)；区域 [00:00,00:10) → 禁止 [23:59:55,00:09:55)
+r = client.post("/api/regions", json={
+    "name": "调度-点接触",
+    "polygon": [[0, 0], [10, 0], [10, 10], [0, 10]],
+    "valid_from": "2026-08-17T00:00:00Z",
+    "valid_to": "2026-08-17T00:10:00Z",
+})
+touch_rid = r.json()["region"]["id"]
+r = client.post("/api/schedule", json={
+    "points": [{"x": 5, "y": 15, "t": 0}, {"x": 15, "y": 5, "t": 10}],
+    "window_start": "2026-08-17T00:00:00Z",
+    "window_end": "2026-08-17T00:20:00Z",
+})
+v = r.json()
+check("单点接触：安全段 [00:09:55,00:20:00)，左闭（valid_to 端点可出发）",
+      len(v["intervals"]) == 1
+      and v["intervals"][0] == {
+          "start": "2026-08-17T00:09:55Z",
+          "end": "2026-08-17T00:20:00Z",
+          "start_inclusive": True, "end_inclusive": False}, str(v))
+
+# 接触时刻恰为 valid_from：s = vf - 5 = 前一日 23:59:55 不可出发（禁止左端闭）
+r = client.post("/api/schedule", json={
+    "points": [{"x": 5, "y": 15, "t": 0}, {"x": 15, "y": 5, "t": 10}],
+    "window_start": "2026-08-16T23:59:00Z",
+    "window_end": "2026-08-17T00:05:00Z",
+})
+v = r.json()
+check("valid_from 端点接触：安全段止于 23:59:55（右端开）",
+      len(v["intervals"]) == 1
+      and v["intervals"][0] == {
+          "start": "2026-08-16T23:59:00Z",
+          "end": "2026-08-16T23:59:55Z",
+          "start_inclusive": True, "end_inclusive": False}, str(v))
+client.delete(f"/api/regions/{touch_rid}")
+
+# 时区归一化：用 +08:00 表示同样的 UTC 窗口，结果必须一致
+r = client.post("/api/schedule", json={
+    "points": SCHED_TRAJ,
+    "window_start": "2026-08-15T08:00:00+08:00",
+    "window_end": "2026-08-15T09:00:00+08:00",
+})
+v2 = r.json()
+r = client.post("/api/schedule", json={
+    "points": SCHED_TRAJ,
+    "window_start": "2026-08-15T00:00:00Z",
+    "window_end": "2026-08-15T01:00:00Z",
+})
+check("带时区窗口归一化到 UTC，结果一致", r.status_code == 200
+      and v2["intervals"] == r.json()["intervals"], str(v2))
+
+# ---- 非法输入：拒绝整个请求 ----
+r = client.post("/api/schedule", json={
+    "points": [{"x": 0, "y": 0, "t": 0}],
+    "window_start": "2026-08-15T00:00:00Z",
+    "window_end": "2026-08-15T01:00:00Z",
+})
+check("轨迹点不足 422", r.status_code == 422, r.text)
+
+r = client.post("/api/schedule", json={
+    "points": [{"x": 0, "y": 0, "t": 1}, {"x": 1, "y": 1, "t": 2}],
+    "window_start": "2026-08-15T00:00:00Z",
+    "window_end": "2026-08-15T01:00:00Z",
+})
+check("首点相对秒数非 0 → 422 invalid_trajectory",
+      r.status_code == 422 and r.json()["error"]["code"] == "invalid_trajectory", r.text)
+
+r = client.post("/api/schedule", json={
+    "points": [{"x": 0, "y": 0, "t": 0}, {"x": 1, "y": 1, "t": 0}],
+    "window_start": "2026-08-15T00:00:00Z",
+    "window_end": "2026-08-15T01:00:00Z",
+})
+check("相对时刻重复 422", r.status_code == 422 and
+      r.json()["error"]["code"] == "invalid_trajectory", r.text)
+
+r = client.post("/api/schedule", json={
+    "points": [{"x": 0, "y": 0, "t": 0}, {"x": 1, "y": 1, "t": -5}],
+    "window_start": "2026-08-15T00:00:00Z",
+    "window_end": "2026-08-15T01:00:00Z",
+})
+check("相对时刻逆序 422", r.status_code == 422, r.text)
+
+r = client.post("/api/schedule",
+    content=_json.dumps({
+        "points": [{"x": "NaN", "y": 0, "t": 0},
+                   {"x": 1, "y": 1, "t": 10}],
+        "window_start": "2026-08-15T00:00:00Z",
+        "window_end": "2026-08-15T01:00:00Z"}),
+    headers={"content-type": "application/json"})
+check("坐标非有限 422", r.status_code == 422, r.text)
+
+r = client.post("/api/schedule",
+    content=_json.dumps({
+        "points": [{"x": 0, "y": 0, "t": 0},
+                   {"x": 1, "y": 1, "t": "Infinity"}],
+        "window_start": "2026-08-15T00:00:00Z",
+        "window_end": "2026-08-15T01:00:00Z"}),
+    headers={"content-type": "application/json"})
+check("相对时刻 Inf 422", r.status_code == 422, r.text)
+
+r = client.post("/api/schedule", json={
+    "points": SCHED_TRAJ,
+    "window_start": "2026-08-15T01:00:00Z",
+    "window_end": "2026-08-15T00:00:00Z",
+})
+check("候选时段不递增 422 invalid_input",
+      r.status_code == 422 and r.json()["error"]["code"] == "invalid_input", r.text)
+
+r = client.post("/api/schedule", json={
+    "points": SCHED_TRAJ,
+    "window_start": "2026-08-15T00:00:00",
+    "window_end": "2026-08-15T01:00:00",
+})
+check("候选时段无时区 422", r.status_code == 422, r.text)
+
+r = client.post("/api/schedule", json={
+    "points": SCHED_TRAJ,
+    "window_start": "2026-08-15T00:00:00Z",
+    "window_end": "2026-08-15T01:00:00Z",
+    "extra": 1,
+})
+check("多余字段 422", r.status_code == 422, r.text)
+
+# 清理调度区域，避免影响后续
+client.delete(f"/api/regions/{sched_rid}")
+
+# ---- 调度一致性：调度进行中区域被修订，本次仍使用同一已提交快照 ----
+r = client.post("/api/regions", json={
+    "name": "调度-快照",
+    "polygon": [[0, 0], [10, 0], [10, 10], [0, 10]],
+    "valid_from": "2026-07-01T00:00:00Z",
+    "valid_to": "2026-07-02T00:00:00Z",
+})
+snap_rid = r.json()["region"]["id"]
+
+orig_safe = geometry.safe_departure_intervals
+barrier_sched_started = threading.Event()
+
+
+def slow_safe(traj, regions, ws, we):
+    barrier_sched_started.set()
+    time.sleep(1.0)  # 给修改线程留出提交窗口
+    return orig_safe(traj, regions, ws, we)
+
+
+geometry.safe_departure_intervals = slow_safe
+try:
+    def worker_sched():
+        t_holder["sched"] = client.post("/api/schedule", json={
+            "points": [{"x": -5, "y": 5, "t": 0}, {"x": 15, "y": 5, "t": 60}],
+            "window_start": "2026-07-01T00:00:00Z",
+            "window_end": "2026-07-02T00:00:00Z",
+        })
+
+    th2 = threading.Thread(target=worker_sched)
+    th2.start()
+    barrier_sched_started.wait(5)
+    # 慢调度期间把区域改名（推进 revision）
+    r = client.patch(f"/api/regions/{snap_rid}", json={"name": "调度-快照-已改"})
+    check("调度期间修订区域提交成功", r.status_code == 200, r.text)
+    new_rev = r.json()["revision"]
+    th2.join(timeout=10)
+    sv = t_holder["sched"].json()
+    check("慢调度使用修订前的已提交快照 revision",
+          sv["revision"] < new_rev, str(sv)[:200])
+    # 新请求看到新 revision
+    sv2 = client.post("/api/schedule", json={
+        "points": [{"x": 100, "y": 100, "t": 0}, {"x": 110, "y": 110, "t": 60}],
+        "window_start": "2026-07-01T00:00:00Z",
+        "window_end": "2026-07-02T00:00:00Z",
+    }).json()
+    check("后续调度使用新版本 revision", sv2["revision"] == new_rev, str(sv2)[:200])
+finally:
+    geometry.safe_departure_intervals = orig_safe
+client.delete(f"/api/regions/{snap_rid}")
+
 print()
 if failures:
     print(f"{len(failures)} 个失败")

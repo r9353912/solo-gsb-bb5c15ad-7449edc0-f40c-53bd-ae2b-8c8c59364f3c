@@ -114,6 +114,37 @@ class VerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class RelativePointIn(BaseModel):
+    """调度请求中的轨迹点：相对首点的秒数（首点必须为 0）。"""
+
+    x: float
+    y: float
+    t: float = Field(description="相对首点的秒数；首点必须为 0，其余严格递增")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("x", "y", "t", mode="before")
+    @classmethod
+    def _check_finite(cls, v, info):
+        return _finite(v, {"x": "坐标 x", "y": "坐标 y", "t": "相对时刻"}.get(
+            info.field_name, info.field_name))
+
+
+class ScheduleRequest(BaseModel):
+    """固定行程的安全出发时刻计算请求。"""
+
+    points: list[RelativePointIn] = Field(min_length=2)
+    window_start: datetime = Field(description="候选出发时段起点（含，带时区）")
+    window_end: datetime = Field(description="候选出发时段终点（不含，带时区）")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _check_time(cls, v: datetime, info):
+        return _require_utc(v, info.field_name)
+
+
 # ---------------------------------------------------------------- 响应模型
 
 def _iso_z(dt: datetime) -> str:
@@ -161,6 +192,20 @@ class VerifyResponse(_UTCDatetimeModel):
     revision: int
     checked_at: datetime
     results: list[RegionResultOut]
+
+
+class DepartureIntervalOut(_UTCDatetimeModel):
+    start: datetime
+    end: datetime
+    start_inclusive: bool
+    end_inclusive: bool
+
+
+class ScheduleResponse(_UTCDatetimeModel):
+    revision: int
+    window_start: datetime
+    window_end: datetime
+    intervals: list[DepartureIntervalOut]
 
 
 class RegionCreatedResponse(_UTCDatetimeModel):

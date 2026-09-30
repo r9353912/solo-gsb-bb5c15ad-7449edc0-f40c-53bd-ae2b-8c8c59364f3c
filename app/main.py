@@ -19,6 +19,8 @@ from .schemas import (
     RegionOut,
     RegionUpdate,
     RevisionOut,
+    ScheduleRequest,
+    ScheduleResponse,
     VerifyRequest,
     VerifyResponse,
 )
@@ -36,8 +38,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.0.0",
-    description="登记平面多边形限行区域并对连续轨迹进行穿越核验。",
+    version="1.1.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间。",
     lifespan=lifespan,
 )
 
@@ -266,6 +268,66 @@ def verify(payload: VerifyRequest):
     )
 
 
+@app.post("/api/schedule", response_model=ScheduleResponse, tags=["scheduling"])
+def schedule(payload: ScheduleRequest):
+    """计算固定行程在候选出发时段内的全部安全出发区间。
+
+    轨迹点用相对首点的秒数给出（首点必须为 0、其余严格递增）；候选时段
+    [window_start, window_end) 带时区，服务端归一化到 UTC。计算为精确的
+    区间运算（不做离散抽样）：对每个区域、每段几何接触 [a,b]（闭）与生效
+    窗口 [vf, vt)（左闭右开），其禁止出发时刻恰为半开区间 [vf-b, vt-a)；
+    全部禁止区间取并集后从候选窗口中扣除。
+
+    整个计算在一个 REPEATABLE READ 只读事务中完成，与 /api/verify 一样，
+    并发修改区域时本请求使用同一已提交快照（响应中带 revision）。
+    """
+    traj = geometry.validate_relative_trajectory(
+        payload.points, lambda p: (p.x, p.y), lambda p: p.t
+    )
+    if payload.window_start >= payload.window_end:
+        raise DomainError(
+            "候选时段必须满足 window_start < window_end（左闭右开，起早于止）",
+            ["window_start", "window_end"],
+        )
+
+    window_start = payload.window_start.timestamp()
+    window_end = payload.window_end.timestamp()
+
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            cur.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            repository.configure_cursor(cur)
+            try:
+                revision, regions = repository.load_snapshot(cur)
+                # 几何计算在事务内完成：快照一直持有到本次计算结束
+                intervals = geometry.safe_departure_intervals(
+                    traj, regions, window_start, window_end
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+
+    out_intervals = [
+        {
+            "start": datetime.fromtimestamp(iv["start"], tz=timezone.utc),
+            "end": datetime.fromtimestamp(iv["end"], tz=timezone.utc),
+            "start_inclusive": iv["start_inclusive"],
+            "end_inclusive": iv["end_inclusive"],
+        }
+        for iv in intervals
+    ]
+
+    return ScheduleResponse(
+        revision=revision,
+        window_start=payload.window_start,
+        window_end=payload.window_end,
+        intervals=out_intervals,
+    )
+
+
 @app.get("/health", tags=["meta"])
 def health():
     with db.pool.connection() as conn:
@@ -284,6 +346,7 @@ def root():
         "endpoints": [
             "POST /api/regions", "GET /api/regions", "GET /api/regions/{id}",
             "PATCH /api/regions/{id}", "DELETE /api/regions/{id}",
-            "GET /api/revision", "POST /api/verify", "GET /health",
+            "GET /api/revision", "POST /api/verify", "POST /api/schedule",
+            "GET /health",
         ],
     }

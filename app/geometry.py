@@ -144,6 +144,46 @@ def validate_trajectory(points: list, time_getter) -> list[tuple[float, float, f
     return out
 
 
+def validate_relative_trajectory(
+    points: list, coord_getter, time_getter
+) -> list[tuple[float, float, float]]:
+    """校验调度用轨迹点，返回 [(t_seconds, x, y), ...]。
+
+    与 validate_trajectory 的区别：时刻是相对首点的秒数而非墙钟时刻。
+    要求首点相对秒数恰好为 0（-0.0 视为 0），其余时刻严格递增；
+    坐标与时刻都必须是有限数（不允许 NaN/Infinity）。
+
+    coord_getter: 点 -> (x, y)；time_getter: 点 -> 相对秒数。
+    """
+    if not isinstance(points, list) or len(points) < 2:
+        raise TrajectoryError("轨迹至少需要 2 个坐标点")
+
+    out: list[tuple[float, float, float]] = []
+    prev_t: float | None = None
+    for i, p in enumerate(points):
+        x, y = coord_getter(p)
+        if not (_is_finite_number(x) and _is_finite_number(y)):
+            raise TrajectoryError(
+                f"第 {i} 个轨迹点坐标必须为有限数，不能为 NaN/Infinity"
+            )
+        t = time_getter(p)
+        if not _is_finite_number(t):
+            raise TrajectoryError(
+                f"第 {i} 个轨迹点相对时刻必须为有限数，不能为 NaN/Infinity"
+            )
+        t = float(t)
+        if i == 0:
+            if t != 0.0:
+                raise TrajectoryError("首点相对秒数必须为 0")
+        elif t <= prev_t:
+            raise TrajectoryError(
+                f"第 {i} 个轨迹点相对时刻必须严格递增（不允许重复或逆序时刻）"
+            )
+        prev_t = t
+        out.append((t, float(x), float(y)))
+    return out
+
+
 # ---------------------------------------------------------------- 区间运算
 
 def _clamp01(u: float) -> float:
@@ -342,3 +382,92 @@ def verify_trajectory(
             ],
         })
     return results
+
+
+# ---------------------------------------------------------------- 出发时刻调度
+
+def contact_intervals_relative(
+    traj: list[tuple[float, float, float]], polygon: Polygon
+) -> list[tuple[float, float]]:
+    """固定轨迹（相对秒数轴）与单个多边形的全部接触区间。
+
+    返回按起点排序、相接/重叠已合并的 [a, b]（几何含边界）闭区间列表，
+    其中 a == b 表示单点接触。时刻为相对首点的秒数。
+    """
+    raw: list[EpochInterval] = []
+    for (t0, x0, y0), (t1, x1, y1) in zip(traj, traj[1:]):
+        for u0, u1 in segment_intersection_params(x0, y0, x1, y1, polygon):
+            raw.append(EpochInterval(t0 + u0 * (t1 - t0), t0 + u1 * (t1 - t0)))
+    merged = merge_intervals(raw)
+    return [(iv.start, iv.end) for iv in merged]
+
+
+def forbidden_departure_intervals(
+    traj: list[tuple[float, float, float]], regions: list[dict]
+) -> list[tuple[float, float]]:
+    """所有区域导致的禁止出发时刻集合（UTC epoch 秒轴上的左闭右开区间）。
+
+    设出发时刻为 s，轨迹在相对时刻 τ 位于接触几何区间 [a, b]（闭），
+    区域生效窗口为 [vf, vt)（左闭右开），则该接触造成违规当且仅当
+        存在 τ∈[a,b] 使 vf <= s+τ < vt
+        ⟺ s ∈ [vf - b, vt - a) （半开区间）。
+    该公式对正长度接触与单点接触（a == b）统一成立；退化点恰落在
+    valid_to 时 (s = vt - a) 为开端点，天然不计违规。
+
+    不同区域、不同接触段产生的半开区间取并集：相接或重叠即合并。
+    """
+    raw: list[EpochInterval] = []
+    for region in regions:
+        vf = region["valid_from"]
+        vt = region["valid_to"]
+        for a, b in contact_intervals_relative(traj, region["polygon"]):
+            lo, hi = vf - b, vt - a
+            if hi - lo > EPS:
+                raw.append(EpochInterval(lo, hi))
+    merged = merge_intervals(raw)
+    return [(iv.start, iv.end) for iv in merged]
+
+
+def safe_departure_intervals(
+    traj: list[tuple[float, float, float]],
+    regions: list[dict],
+    window_start: float,
+    window_end: float,
+) -> list[dict]:
+    """在候选出发时段 [window_start, window_end) 内计算全部安全出发区间。
+
+    安全集合 = 候选窗口（左闭右开）减去禁止出发区间的并集（左闭右开）。
+    结果按起点排序，端点均为「左闭右开」；无可行时返回 []。
+    """
+    if window_end <= window_start:
+        return []
+
+    forbidden = forbidden_departure_intervals(traj, regions)
+    safe: list[dict] = []
+    cursor = window_start
+    for lo, hi in forbidden:
+        if hi <= cursor + EPS:
+            # 整段禁止区间已在游标之前
+            continue
+        if lo >= window_end - EPS:
+            # 禁止区间起点已到/越过窗口右端，后面都是安全的
+            break
+        if lo > cursor + EPS:
+            safe.append({
+                "start": cursor,
+                "end": min(lo, window_end),
+                "start_inclusive": True,
+                "end_inclusive": False,
+            })
+        if hi > cursor:
+            cursor = hi
+
+    # 禁止区间可能远跨过窗口右端：尾部安全段是否存在由游标位置统一决定
+    if cursor < window_end - EPS:
+        safe.append({
+            "start": cursor,
+            "end": window_end,
+            "start_inclusive": True,
+            "end_inclusive": False,
+        })
+    return safe
