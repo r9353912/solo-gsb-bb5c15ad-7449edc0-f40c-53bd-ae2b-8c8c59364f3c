@@ -269,6 +269,197 @@ try:
 finally:
     geometry.verify_trajectory = orig
 
+# ---- 安全出发区间 ----
+# 本节使用独立区域集：先清空前面各节遗留的区域，避免叠加干扰
+for _r in client.get("/api/regions").json():
+    client.delete(f"/api/regions/{_r['id']}")
+
+# 专用标准区域 [0,10]^2
+r = client.post("/api/regions", json={
+    "name": "调度专用区",
+    "polygon": [[0, 0], [10, 0], [10, 10], [0, 10]],
+    "valid_from": "2026-09-01T00:00:00Z",
+    "valid_to": "2026-10-01T00:00:00Z",
+})
+sched_rid = r.json()["region"]["id"]
+
+r = client.post("/api/safe-departures", json={
+    "points": [
+        {"x": -5, "y": 5, "t": 0},
+        {"x": 15, "y": 5, "t": 10},
+    ],
+    "window_start": "2026-09-30T00:00:00Z",
+    "window_end": "2026-09-30T00:01:00Z",
+})
+check("safe-departures 200", r.status_code == 200, r.text)
+sd = r.json()
+# 区域整月生效，接触相对窗 [2.5,7.5]：禁止出发 [00:00:00-7.5, 月末-2.5)
+# 候选窗内全部不安全（禁止起点为前一天 23:59:52.5）
+check("整窗被禁止区间覆盖 -> 空数组", sd["intervals"] == [], str(sd))
+check("响应当前 revision", sd["revision"] == client.get("/api/revision").json()["revision"])
+check("回显候选窗口（UTC/Z）",
+      sd["window_start"] == "2026-09-30T00:00:00Z"
+      and sd["window_end"] == "2026-09-30T00:01:00Z")
+
+# 收窄区域生效窗为 [00:00:10, 00:00:20)，禁止出发 [00:00:02.5, 00:00:17.5)
+client.patch(f"/api/regions/{sched_rid}", json={
+    "valid_from": "2026-09-30T00:00:10Z",
+    "valid_to": "2026-09-30T00:00:20Z",
+})
+r = client.post("/api/safe-departures", json={
+    "points": [
+        {"x": -5, "y": 5, "t": 0},
+        {"x": 15, "y": 5, "t": 10},
+    ],
+    "window_start": "2026-09-30T00:00:00Z",
+    "window_end": "2026-09-30T00:00:30Z",
+})
+sd = r.json()["intervals"]
+check("解析区间：安全 [00:00:00,00:00:02.5) 与 [00:00:17.5,00:00:30)",
+      len(sd) == 2
+      and sd[0] == {"start": "2026-09-30T00:00:00Z",
+                    "end": "2026-09-30T00:00:02.500000Z",
+                    "start_inclusive": True, "end_inclusive": False}
+      and sd[1] == {"start": "2026-09-30T00:00:17.500000Z",
+                    "end": "2026-09-30T00:00:30Z",
+                    "start_inclusive": True, "end_inclusive": False},
+      str(sd))
+
+# 非 UTC 时区的候选窗等价换算（+02:00）
+r2 = client.post("/api/safe-departures", json={
+    "points": [
+        {"x": -5, "y": 5, "t": 0},
+        {"x": 15, "y": 5, "t": 10},
+    ],
+    "window_start": "2026-09-30T02:00:00+02:00",
+    "window_end": "2026-09-30T02:00:30+02:00",
+})
+check("带时区候选窗换算为 UTC 后结果一致",
+      r2.status_code == 200 and r2.json()["intervals"] == sd, r2.text)
+
+# 单点接触恰逢生效端点
+client.patch(f"/api/regions/{sched_rid}", json={
+    "valid_from": "2026-09-30T00:00:05Z",
+    "valid_to": "2026-09-30T01:00:00Z",
+})
+r = client.post("/api/safe-departures", json={
+    "points": [{"x": 5, "y": 15, "t": 0}, {"x": 15, "y": 5, "t": 10}],
+    "window_start": "2026-09-30T00:00:00Z",
+    "window_end": "2026-09-30T00:00:10Z",
+})
+check("单点接触@valid_from(闭)：整窗不安全",
+      r.json()["intervals"] == [], r.text)
+client.patch(f"/api/regions/{sched_rid}", json={
+    "valid_from": "2026-09-30T00:00:00Z",
+    "valid_to": "2026-09-30T00:00:05Z",
+})
+r = client.post("/api/safe-departures", json={
+    "points": [{"x": 5, "y": 15, "t": 0}, {"x": 15, "y": 5, "t": 10}],
+    "window_start": "2026-09-30T00:00:00Z",
+    "window_end": "2026-09-30T00:00:10Z",
+})
+check("单点接触@valid_to(开)：d=00:00:00 安全",
+      len(r.json()["intervals"]) == 1
+      and r.json()["intervals"][0]["start"] == "2026-09-30T00:00:00Z"
+      and r.json()["intervals"][0]["end"] == "2026-09-30T00:00:10Z", r.text)
+
+# ---- 非法输入拒绝整个请求（422） ----
+def bad_schedule(label, payload, code=None):
+    rr = client.post("/api/safe-departures", json=payload)
+    ok = rr.status_code == 422 and (code is None or rr.json()["error"]["code"] == code)
+    check(f"非法调度请求 422：{label}", ok, rr.text)
+
+
+_base_window = ("2026-09-30T00:00:00Z", "2026-09-30T01:00:00Z")
+bad_schedule("轨迹点不足", {"points": [{"x": 0, "y": 0, "t": 0}],
+             "window_start": _base_window[0], "window_end": _base_window[1]})
+bad_schedule("首点相对时刻非0", {
+    "points": [{"x": 0, "y": 0, "t": 1}, {"x": 1, "y": 1, "t": 2}],
+    "window_start": _base_window[0], "window_end": _base_window[1]},
+    code="invalid_trajectory")
+bad_schedule("相对时刻不递增", {
+    "points": [{"x": 0, "y": 0, "t": 0}, {"x": 1, "y": 1, "t": 0}],
+    "window_start": _base_window[0], "window_end": _base_window[1]},
+    code="invalid_trajectory")
+bad_schedule("坐标 NaN", {
+    "points": [{"x": "NaN", "y": 0, "t": 0}, {"x": 1, "y": 1, "t": 1}],
+    "window_start": _base_window[0], "window_end": _base_window[1]})
+bad_schedule("相对时刻 Infinity", {
+    "points": [{"x": 0, "y": 0, "t": 0}, {"x": 1, "y": 1, "t": "Infinity"}],
+    "window_start": _base_window[0], "window_end": _base_window[1]})
+bad_schedule("候选时段不递增", {
+    "points": [{"x": 0, "y": 0, "t": 0}, {"x": 1, "y": 1, "t": 1}],
+    "window_start": "2026-09-30T01:00:00Z", "window_end": "2026-09-30T00:00:00Z"},
+    code="invalid_input")
+bad_schedule("候选时段相等", {
+    "points": [{"x": 0, "y": 0, "t": 0}, {"x": 1, "y": 1, "t": 1}],
+    "window_start": _base_window[0], "window_end": _base_window[0]},
+    code="invalid_input")
+bad_schedule("候选时段无时区", {
+    "points": [{"x": 0, "y": 0, "t": 0}, {"x": 1, "y": 1, "t": 1}],
+    "window_start": "2026-09-30T00:00:00", "window_end": "2026-09-30T01:00:00"})
+
+# 非法调度请求不改变 revision
+rev_before = client.get("/api/revision").json()["revision"]
+client.post("/api/safe-departures", json={
+    "points": [{"x": 0, "y": 0, "t": 0}],
+    "window_start": _base_window[0], "window_end": _base_window[1],
+})
+check("只读调度请求不改变 revision",
+      client.get("/api/revision").json()["revision"] == rev_before)
+
+# ---- 并发一致性：慢调度期间修订区域，仍使用同一已提交快照 ----
+client.patch(f"/api/regions/{sched_rid}", json={
+    "valid_from": "2026-09-01T00:00:00Z",
+    "valid_to": "2026-10-01T00:00:00Z",
+    "name": "调度快照前",
+})
+orig_safe = geometry.safe_departure_intervals
+barrier2_started = threading.Event()
+
+
+def slow_safe(traj, regions, ws, we):
+    barrier2_started.set()
+    time.sleep(1.0)
+    return orig_safe(traj, regions, ws, we)
+
+
+geometry.safe_departure_intervals = slow_safe
+try:
+    holder = {}
+
+    def do_schedule():
+        holder["r"] = client.post("/api/safe-departures", json={
+            "points": [{"x": -5, "y": 5, "t": 0}, {"x": 15, "y": 5, "t": 10}],
+            "window_start": "2026-09-30T00:00:00Z",
+            "window_end": "2026-09-30T00:01:00Z",
+        })
+
+    th = threading.Thread(target=do_schedule)
+    th.start()
+    barrier2_started.wait(5)
+    # 慢调度期间把区域改成完全不相交的远方区域并提交
+    client.patch(f"/api/regions/{sched_rid}", json={
+        "name": "调度快照后",
+        "polygon": [[1000, 1000], [1010, 1000], [1010, 1010], [1000, 1010]],
+    })
+    th.join(timeout=10)
+    snap = holder["r"].json()
+    check("慢调度使用修改前快照（旧 [0,10] 区域覆盖整窗 -> 空）",
+          snap["intervals"] == [], str(snap))
+    # 新请求看到新版本：远方区域不相交 -> 整窗安全
+    after = client.post("/api/safe-departures", json={
+        "points": [{"x": -5, "y": 5, "t": 0}, {"x": 15, "y": 5, "t": 10}],
+        "window_start": "2026-09-30T00:00:00Z",
+        "window_end": "2026-09-30T00:01:00Z",
+    }).json()
+    check("后续调度使用新版本（远方区域 -> 整窗安全）",
+          len(after["intervals"]) == 1
+          and after["intervals"][0]["start"] == "2026-09-30T00:00:00Z"
+          and after["intervals"][0]["end"] == "2026-09-30T00:01:00Z", str(after))
+finally:
+    geometry.safe_departure_intervals = orig_safe
+
 print()
 if failures:
     print(f"{len(failures)} 个失败")

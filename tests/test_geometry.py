@@ -226,6 +226,122 @@ cs = geometry.verify_trajectory(
 )[0]["crossings"]
 check("零长度段停留在区域内：1 段", len(cs) == 1)
 
+# ---------------------------------------------------------------- 安全出发时刻
+
+def RP(x, y, t):
+    """相对时间轨迹点。"""
+    p = type("P", (), {})()
+    p.x, p.y, p.t = x, y, t
+    return p
+
+
+# (-5,5)t=0 -> (15,5)t=10：几何接触相对时间闭区间 [2.5, 7.5]
+rel_traj = geometry.validate_relative_trajectory([RP(-5, 5, 0), RP(15, 5, 10)])
+check("相对轨迹校验通过", rel_traj == [(0.0, -5.0, 5.0), (10.0, 15.0, 5.0)])
+contacts = geometry.geometric_contact_intervals(rel_traj, R["polygon"])
+check("几何接触相对区间 [2.5, 7.5]", len(contacts) == 1
+      and approx(contacts[0][0], 2.5) and approx(contacts[0][1], 7.5))
+
+# 区域 10:00~11:00 生效；候选窗 09:59:50~10:00:30
+# 禁止出发区间 [ws-7.5, we-2.5) = [09:59:52.5, 10:59:57.5)
+# 窗内安全仅 [09:59:50, 09:59:52.5)
+RS = region(7, "S", "2026-09-30T10:00:00Z", "2026-09-30T11:00:00Z", SQUARE)
+safe = geometry.safe_departure_intervals(
+    rel_traj, [RS], E("2026-09-30T09:59:50Z"), E("2026-09-30T10:00:30Z"))
+check("基本安全区间 [09:59:50, 09:59:52.5)",
+      len(safe) == 1 and approx(safe[0][0], E("2026-09-30T09:59:50Z"))
+      and approx(safe[0][1], E("2026-09-30T09:59:52.5Z")))
+
+# 候选窗完全落在禁止区间内 -> 空数组
+safe = geometry.safe_departure_intervals(
+    rel_traj, [RS], E("2026-09-30T10:10:00Z"), E("2026-09-30T10:20:00Z"))
+check("无安全出发时刻返回空数组", safe == [])
+
+# 无区域 -> 整个候选窗都安全
+safe = geometry.safe_departure_intervals(
+    rel_traj, [], E("2026-09-30T10:00:00Z"), E("2026-09-30T10:30:00Z"))
+check("无区域时整窗安全", len(safe) == 1
+      and approx(safe[0][0], E("2026-09-30T10:00:00Z"))
+      and approx(safe[0][1], E("2026-09-30T10:30:00Z")))
+
+# 两区域各切掉一段，中间留安全缝
+RS1 = region(8, "S1", "2026-09-30T10:00:00Z", "2026-09-30T10:00:05Z", SQUARE)
+RS2 = region(9, "S2", "2026-09-30T10:00:15Z", "2026-09-30T10:00:25Z", SQUARE)
+# 禁1=[ws-7.5, we-2.5)=[09:59:57.5, 10:00:02.5)
+# 禁2=[10:00:07.5, 10:00:22.5)
+safe = geometry.safe_departure_intervals(
+    rel_traj, [RS1, RS2], E("2026-09-30T10:00:00Z"), E("2026-09-30T10:00:15Z"))
+check("两段禁止区间间留安全缝 [10:00:02.5, 10:00:07.5)",
+      len(safe) == 1
+      and approx(safe[0][0], E("2026-09-30T10:00:02.5Z"))
+      and approx(safe[0][1], E("2026-09-30T10:00:07.5Z")))
+
+# 半开相接：禁1右端 10:00:02.5 与禁2左端 10:00:02.5 相接 -> 合并，安全缝消失
+RS3 = region(10, "S3", "2026-09-30T10:00:07.5Z", "2026-09-30T10:00:15Z", SQUARE)
+# 禁3 起点 = 10:00:07.5 - 7.5 = 10:00:00
+RS4 = region(11, "S4", "2026-09-30T10:00:10Z", "2026-09-30T10:00:20Z", SQUARE)
+# 禁3=[10:00:00, 10:00:12.5)，禁4=[10:00:02.5, 10:00:17.5)：重叠覆盖整窗
+safe = geometry.safe_departure_intervals(
+    rel_traj, [RS3, RS4], E("2026-09-30T10:00:00Z"), E("2026-09-30T10:00:10Z"))
+check("重叠禁止区间取并后整窗不安全", safe == [])
+
+# 单点接触（相对 t=5 擦角点）+ 恰逢 valid_from（闭）：d 使接触落在 valid_from 被禁
+rel_touch = geometry.validate_relative_trajectory([RP(5, 15, 0), RP(15, 5, 10)])
+RVF = region(12, "VF", "2026-09-30T10:00:05Z", "2026-09-30T11:00:00Z", SQUARE)
+# 禁=[10:00:05-5, 11:00-5)=[10:00:00, 10:59:55)；d=10:00:00 不安全
+safe = geometry.safe_departure_intervals(
+    rel_touch, [RVF], E("2026-09-30T10:00:00Z"), E("2026-09-30T10:00:10Z"))
+check("单点接触恰逢 valid_from（闭）：该出发时刻被禁", safe == [])
+# 候选窗从 10:59:55 起：d=10:59:55 时接触==valid_to（开）安全
+safe = geometry.safe_departure_intervals(
+    rel_touch, [RVF], E("2026-09-30T10:59:55Z"), E("2026-09-30T11:00:05Z"))
+check("接触在 valid_to（开）时刻安全：[10:59:55, 11:00:05)",
+      len(safe) == 1
+      and approx(safe[0][0], E("2026-09-30T10:59:55Z"))
+      and approx(safe[0][1], E("2026-09-30T11:00:05Z")))
+
+# 单点接触恰逢 valid_to（开）：禁止区间 [.., valid_to-5) 在其右端点开
+RVT = region(13, "VT", "2026-09-30T10:00:00Z", "2026-09-30T10:00:05Z", SQUARE)
+# 禁=[09:59:55, 10:00:00)；候选窗 [10:00:00, ...) 全部安全（d=10:00:00 接触==valid_to 开）
+safe = geometry.safe_departure_intervals(
+    rel_touch, [RVT], E("2026-09-30T10:00:00Z"), E("2026-09-30T10:00:10Z"))
+check("单点接触恰逢 valid_to（开）：d=valid_to-接触偏移 安全",
+      len(safe) == 1
+      and approx(safe[0][0], E("2026-09-30T10:00:00Z"))
+      and approx(safe[0][1], E("2026-09-30T10:00:10Z")))
+
+# 沿边界运动（接触覆盖整个相对时段 [0,10]）：禁=[ws-10, we)
+rel_edge = geometry.validate_relative_trajectory([RP(0, 0, 0), RP(10, 0, 10)])
+safe = geometry.safe_departure_intervals(
+    rel_edge, [RS], E("2026-09-30T09:59:00Z"), E("2026-09-30T11:30:00Z"))
+check("沿边界运动：禁 [09:59:50, 11:00:00)，两侧安全",
+      len(safe) == 2
+      and approx(safe[0][0], E("2026-09-30T09:59:00Z"))
+      and approx(safe[0][1], E("2026-09-30T09:59:50Z"))
+      and approx(safe[1][0], E("2026-09-30T11:00:00Z"))
+      and approx(safe[1][1], E("2026-09-30T11:30:00Z")))
+
+# 多段轨迹与多个区域的多段安全区间：禁止区间内外交替
+# 用不生效（窗口远在未来）的区域应等价于无区域
+RDEAD = region(14, "DEAD", "2030-01-01T00:00:00Z", "2030-01-02T00:00:00Z", SQUARE)
+safe = geometry.safe_departure_intervals(
+    rel_traj, [RDEAD], E("2026-09-30T10:00:00Z"), E("2026-09-30T10:30:00Z"))
+check("区域在候选范围外不生效：整窗安全", len(safe) == 1)
+
+# 相对轨迹校验
+expect_error("相对轨迹首点非0", lambda: geometry.validate_relative_trajectory(
+    [RP(0, 0, 1), RP(1, 1, 2)]))
+expect_error("相对轨迹时刻重复", lambda: geometry.validate_relative_trajectory(
+    [RP(0, 0, 0), RP(1, 1, 0)]))
+expect_error("相对轨迹时刻逆序", lambda: geometry.validate_relative_trajectory(
+    [RP(0, 0, 0), RP(1, 1, -1)]))
+expect_error("相对轨迹点不足", lambda: geometry.validate_relative_trajectory(
+    [RP(0, 0, 0)]))
+expect_error("相对轨迹 NaN 坐标", lambda: geometry.validate_relative_trajectory(
+    [RP(float("nan"), 0, 0), RP(1, 1, 1)]))
+expect_error("相对轨迹 Inf 时刻", lambda: geometry.validate_relative_trajectory(
+    [RP(0, 0, 0), RP(1, 1, float("inf"))]))
+
 print()
 if failures:
     print(f"{len(failures)} 个用例失败")

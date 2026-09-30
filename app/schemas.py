@@ -114,6 +114,45 @@ class VerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class PointRelIn(BaseModel):
+    """相对时间轨迹点：t 为相对首点的秒数（首点必须为 0）。"""
+
+    x: float
+    y: float
+    t: float
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("x", "y", "t", mode="before")
+    @classmethod
+    def _check_finite(cls, v, info):
+        return _finite(v, f"轨迹点 {info.field_name}")
+
+
+class SafeDeparturesRequest(BaseModel):
+    """固定行程 + 候选出发窗口 [window_start, window_end)（左闭右开）。"""
+
+    points: list[PointRelIn] = Field(
+        min_length=2,
+        description="相对时间轨迹点 [[x,y,t(相对秒)]，...]；首点 t=0，后续严格递增",
+    )
+    window_start: datetime = Field(description="候选出发时段起点（含），必须带时区")
+    window_end: datetime = Field(description="候选出发时段终点（不含），必须带时区")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _check_time(cls, v: datetime, info):
+        return _require_utc(v, info.field_name)
+
+    def validate_window_order(self) -> None:
+        if self.window_start >= self.window_end:
+            raise ValueError(
+                "候选出发时段必须满足 window_start < window_end（左闭右开，起早于止）"
+            )
+
+
 # ---------------------------------------------------------------- 响应模型
 
 def _iso_z(dt: datetime) -> str:
@@ -161,6 +200,22 @@ class VerifyResponse(_UTCDatetimeModel):
     revision: int
     checked_at: datetime
     results: list[RegionResultOut]
+
+
+class SafeIntervalOut(_UTCDatetimeModel):
+    """安全出发区间（UTC）；统一为左闭右开 [start, end)。"""
+
+    start: datetime
+    end: datetime
+    start_inclusive: bool = True
+    end_inclusive: bool = False
+
+
+class SafeDeparturesResponse(_UTCDatetimeModel):
+    revision: int
+    window_start: datetime
+    window_end: datetime
+    intervals: list[SafeIntervalOut]
 
 
 class RegionCreatedResponse(_UTCDatetimeModel):

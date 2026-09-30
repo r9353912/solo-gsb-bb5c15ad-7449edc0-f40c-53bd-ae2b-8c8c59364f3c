@@ -19,6 +19,9 @@ from .schemas import (
     RegionOut,
     RegionUpdate,
     RevisionOut,
+    SafeDeparturesRequest,
+    SafeDeparturesResponse,
+    SafeIntervalOut,
     VerifyRequest,
     VerifyResponse,
 )
@@ -35,9 +38,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="临时限行核验服务",
-    version="1.0.0",
-    description="登记平面多边形限行区域并对连续轨迹进行穿越核验。",
+    title="临时限行核验与场地调度服务",
+    version="1.1.0",
+    description=(
+        "登记平面多边形限行区域，对连续轨迹进行穿越核验，并计算固定行程在候选 "
+        "出发窗口内所有不触碰限行区的安全出发区间。"
+    ),
     lifespan=lifespan,
 )
 
@@ -266,6 +272,60 @@ def verify(payload: VerifyRequest):
     )
 
 
+@app.post("/api/safe-departures", response_model=SafeDeparturesResponse,
+          tags=["scheduling"])
+def safe_departures(payload: SafeDeparturesRequest):
+    """求固定行程在候选出发窗口内所有不触碰限行区的安全出发区间。
+
+    轨迹点的 t 为相对首点的秒数（首点必须为 0，其余严格递增）；首点在
+    出发时刻 d 出现于其坐标位置，其余点按相对秒平移。计算是精确的解析
+    区间运算（禁止出发区间取并后对候选窗口取补），不做离散抽样；
+    单点接触、沿边界运动、恰逢 valid_from/valid_to 均按端点开闭精确处理。
+
+    与 /api/verify 相同，整个计算在一个 REPEATABLE READ 只读事务中完成，
+    区域并发修订时本请求使用同一已提交快照（响应中带 revision）。
+    """
+    try:
+        payload.validate_window_order()
+    except ValueError as exc:
+        raise DomainError(str(exc), ["window_start", "window_end"]) from exc
+
+    # 相对时刻严格递增、首点为 0、坐标/时刻有限在几何层统一报错
+    traj = geometry.validate_relative_trajectory(payload.points)
+
+    ws_epoch = payload.window_start.timestamp()
+    we_epoch = payload.window_end.timestamp()
+
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            cur.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            repository.configure_cursor(cur)
+            try:
+                revision, regions = repository.load_snapshot(cur)
+                intervals = geometry.safe_departure_intervals(
+                    traj, regions, ws_epoch, we_epoch
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+
+    return SafeDeparturesResponse(
+        revision=revision,
+        window_start=payload.window_start,
+        window_end=payload.window_end,
+        intervals=[
+            SafeIntervalOut(
+                start=datetime.fromtimestamp(start, tz=timezone.utc),
+                end=datetime.fromtimestamp(end, tz=timezone.utc),
+            )
+            for start, end in intervals
+        ],
+    )
+
+
 @app.get("/health", tags=["meta"])
 def health():
     with db.pool.connection() as conn:
@@ -284,6 +344,7 @@ def root():
         "endpoints": [
             "POST /api/regions", "GET /api/regions", "GET /api/regions/{id}",
             "PATCH /api/regions/{id}", "DELETE /api/regions/{id}",
-            "GET /api/revision", "POST /api/verify", "GET /health",
+            "GET /api/revision", "POST /api/verify",
+            "POST /api/safe-departures", "GET /health",
         ],
     }

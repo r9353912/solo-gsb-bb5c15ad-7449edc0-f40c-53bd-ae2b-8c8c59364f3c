@@ -60,6 +60,26 @@ def main() -> None:
                     f"{'（单点接触）' if c['point_contact'] else ''}"
                 )
 
+    # 安全出发时刻：固定行程（相对秒轨迹，首点 t=0）+ 候选出发窗口。
+    # 行程 (-50,50)t=0 -> (150,50)t=60，对 A 区 [0,100]^2 的接触在相对 [15,45]；
+    # A 区 9 月全月生效，候选窗放在生效期之前，得到一个左闭右开的安全区间。
+    departures = call("POST", "/api/safe-departures", {
+        "points": [
+            {"x": -50, "y": 50, "t": 0},
+            {"x": 150, "y": 50, "t": 60},
+        ],
+        "window_start": "2026-08-31T23:58:00Z",
+        "window_end": "2026-08-31T23:59:30Z",
+    })
+    show("安全出发区间", departures)
+    if departures["intervals"]:
+        for iv in departures["intervals"]:
+            bracket_l = "[" if iv["start_inclusive"] else "("
+            bracket_r = "]" if iv["end_inclusive"] else ")"
+            print(f"  可出发：{bracket_l}{iv['start']}, {iv['end']}{bracket_r}（UTC）")
+    else:
+        print("  候选窗口内没有安全出发时刻")
+
     show("删除示例区域", call("DELETE", f"/api/regions/{region['region']['id']}"))
 
 

@@ -71,4 +71,24 @@ B_ID=$(curl -fsS "$BASE_URL/api/regions" \
   | python3 -c 'import sys,json; print(next(r["id"] for r in json.load(sys.stdin) if r["name"]=="B区-吊装半径"))')
 curl -fsS -X DELETE "$BASE_URL/api/regions/$B_ID"; echo
 
+echo "== 10. 安全出发时刻：固定行程在候选时窗内的所有安全出发区间 =="
+# 行程用相对秒数描述（首点 t=0）：(-50,50)t=0 -> (150,50)t=60，直线匀速。
+# 此时 A 区已在第 8 步扩大为 [0,120]^2，几何接触发生在相对时间 [15, 51]
+# （进入 x=0 在 60*50/200=15s，离开 x=120 在 60*170/200=51s）；
+# A 区自 09-01T00:00:00Z 起生效，故禁止出发区间从 [08-31T23:59:09, ...) 开始
+# （ws - 接触结束相对秒 = 00:00:00 - 51s）。候选窗放在生效期之前，得到
+# 左闭右开的安全段 [23:58:00, 23:59:09)。
+curl -fsS -X POST "$BASE_URL/api/safe-departures" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "points": [
+          {"x": -50, "y": 50, "t": 0},
+          {"x": 150, "y": 50, "t": 60}
+        ],
+        "window_start": "2026-08-31T23:58:00Z",
+        "window_end":   "2026-08-31T23:59:30Z"
+      }'; echo
+# 端点固定为左闭右开（start_inclusive=true, end_inclusive=false）；
+# 无可行时 intervals 返回空数组 []。
+
 echo "完成。"

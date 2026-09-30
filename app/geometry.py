@@ -8,6 +8,19 @@
 * 区域只在左闭右开的生效时段 [valid_from, valid_to) 内参与核验。
 * 边界接触也算穿越；单点接触输出起止时刻相同的退化区间。
 * 同一区域相接（端点相同）或重叠的穿越区间合并。
+
+场地调度（安全出发时刻）
+-----------------------
+给定"相对时间轨迹"（首点相对秒数 0、后续严格递增）与候选出发窗口
+[window_start, window_end)（左闭右开），求所有使平移后的 UTC 轨迹
+不触碰任何生效区域的出发时刻。推导为纯解析的区间运算（不做离散抽样）：
+
+* 出发时刻为 d 时，相对时间 t 的轨迹位置在 UTC 时刻 d+t 出现；
+* 轨迹对某区域的一段几何接触为闭区间 [a, b]（a==b 即单点接触）；
+* 该区域生效窗为 [ws, we)，则平移后的接触与生效窗相交
+  （含端点语义）当且仅当 d ∈ [ws - b, we - a)；
+* 对全部区域、全部接触的禁止出发区间取并，再从候选窗口作集合差，
+  得到的每个连通段都是一个安全出发区间，端点均为左闭右开。
 """
 from __future__ import annotations
 
@@ -141,6 +154,38 @@ def validate_trajectory(points: list, time_getter) -> list[tuple[float, float, f
             )
         prev_t = epoch
         out.append((epoch, float(p.x), float(p.y)))
+    return out
+
+
+def validate_relative_trajectory(points: list) -> list[tuple[float, float, float]]:
+    """校验"相对秒数"轨迹，返回 [(rel_seconds, x, y), ...]。
+
+    要求：至少 2 个点；每个点含有限数 x、y、t；首点 t 必须为 0；
+    其余 t 必须严格递增（允许正的非整数秒）。
+    """
+    if not isinstance(points, list) or len(points) < 2:
+        raise TrajectoryError("轨迹至少需要 2 个坐标点")
+
+    out: list[tuple[float, float, float]] = []
+    prev_t: float | None = None
+    for i, p in enumerate(points):
+        x = getattr(p, "x", None)
+        y = getattr(p, "y", None)
+        t = getattr(p, "t", None)
+        if not (_is_finite_number(x) and _is_finite_number(y) and _is_finite_number(t)):
+            raise TrajectoryError(
+                f"第 {i} 个轨迹点的坐标与相对时刻必须为有限数，不能为 NaN/Infinity"
+            )
+        t = float(t)
+        if i == 0:
+            if t != 0.0:
+                raise TrajectoryError("首个轨迹点的相对时刻必须为 0")
+        elif t <= prev_t:
+            raise TrajectoryError(
+                f"第 {i} 个轨迹点的相对时刻必须严格递增（不允许重复或逆序）"
+            )
+        prev_t = t
+        out.append((t, float(x), float(y)))
     return out
 
 
@@ -342,3 +387,91 @@ def verify_trajectory(
             ],
         })
     return results
+
+
+# ---------------------------------------------------------------- 安全出发时刻
+
+def _time_tol(*values: float) -> float:
+    """按参与运算时刻的量级返回浮点吸收容差（约若干 ULP）。"""
+    scale = max(1.0, max((abs(v) for v in values), default=1.0))
+    return max(EPS, 8.0 * math.ulp(scale))
+
+
+def geometric_contact_intervals(
+    traj: list[tuple[float, float, float]], polygon: Polygon
+) -> list[tuple[float, float]]:
+    """整条（相对时间）轨迹与单个多边形的几何接触区间（相对秒，闭区间）。
+
+    含边界：内部穿行、沿边界运动、单点接触、原地段留都计入；
+    相接或重叠的接触按区间合并。返回 [(a, b), ...]（a == b 为单点接触）。
+    """
+    raw: list[EpochInterval] = []
+    for (t0, x0, y0), (t1, x1, y1) in zip(traj, traj[1:]):
+        for u0, u1 in segment_intersection_params(x0, y0, x1, y1, polygon):
+            raw.append(EpochInterval(t0 + u0 * (t1 - t0), t0 + u1 * (t1 - t0)))
+    return [(iv.start, iv.end) for iv in merge_intervals(raw)]
+
+
+def _union_half_open(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """半开区间 [lo, hi) 的并集；相接（[a,b)∪[b,c)=[a,c)）即合并。"""
+    positive = [(lo, hi) for lo, hi in intervals if hi > lo]
+    if not positive:
+        return []
+    ordered = sorted(positive, key=lambda iv: (iv[0], iv[1]))
+    merged: list[tuple[float, float]] = []
+    cur_lo, cur_hi = ordered[0]
+    for lo, hi in ordered[1:]:
+        if lo <= cur_hi + _time_tol(lo, cur_hi):
+            if hi > cur_hi:
+                cur_hi = hi
+        else:
+            merged.append((cur_lo, cur_hi))
+            cur_lo, cur_hi = lo, hi
+    merged.append((cur_lo, cur_hi))
+    return merged
+
+
+def safe_departure_intervals(
+    traj: list[tuple[float, float, float]],
+    regions: list[dict],
+    window_start: float,
+    window_end: float,
+) -> list[tuple[float, float]]:
+    """在候选出发窗口 [window_start, window_end)（UTC epoch 秒，左闭右开）内，
+    返回所有使平移后的轨迹不触碰任何生效区域的出发时刻区间。
+
+    traj:    相对秒轨迹 [(rel_t, x, y), ...]，首点 rel_t=0、后续严格递增。
+    regions: [{"id","name","valid_from"(epoch),"valid_to"(epoch),"polygon"}]。
+
+    纯解析区间运算（不做离散抽样）。对闭接触 [a,b] 与生效窗 [ws,we)，
+    禁止出发区间恰为 [ws-b, we-a)（推导见模块文档）；对全部禁止区间取并，
+    再从候选窗口取补集。返回的每个安全区间也是左闭右开 [lo, hi)。
+    """
+    forbidden: list[tuple[float, float]] = []
+    for region in regions:
+        ws = region["valid_from"]
+        we = region["valid_to"]
+        for a, b in geometric_contact_intervals(traj, region["polygon"]):
+            lo = ws - b
+            hi = we - a
+            # 与候选窗口完全不相交的禁止区间无需并入（半开相交判定）
+            if hi <= window_start or lo >= window_end:
+                continue
+            forbidden.append((lo, hi))
+
+    blocked = _union_half_open(forbidden)
+
+    safe: list[tuple[float, float]] = []
+    cursor = window_start
+    for lo, hi in blocked:
+        s = max(lo, window_start)
+        e = min(hi, window_end)
+        if s >= e:
+            continue
+        if s - cursor > _time_tol(s, cursor):
+            safe.append((cursor, s))
+        if e > cursor:
+            cursor = e
+    if window_end - cursor > _time_tol(window_end, cursor):
+        safe.append((cursor, window_end))
+    return safe
